@@ -51,8 +51,7 @@ scikit-learn>=1.2.0
 1. **Clone or download the project.**
 
    ```bash
-   git clone <repo_link>
-   cd YOLOv8n-ViT-Hybrid
+   git clone https://github.com/Chanduchawla/Hybridizing-yolov8n-with-vision-transformers-for-student-activity-Recognition
    ```
 
 2. **Set up the dataset.**
