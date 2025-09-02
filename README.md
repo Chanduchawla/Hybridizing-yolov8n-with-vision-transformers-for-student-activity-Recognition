@@ -104,7 +104,7 @@ If you use this code in your research, please cite:
 
 **Chevala Chandu**
 *Hybridizing YOLOv8n with Vision Transformers for Superior Real-Time Student Activity Detection.*
-Arabian Journal for Science and Engineering.
+
 
 ---
 
