@@ -42,6 +42,7 @@ pandas>=1.5.0
 matplotlib>=3.7.0
 seaborn>=0.12.0
 scikit-learn>=1.2.0
+roboflow
 ```
 
 ---
