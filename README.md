@@ -68,15 +68,15 @@ scikit-learn>=1.2.0
 3. **Train the YOLOv8n model.**
 
    ```bash
-   python scb_using_yolo.ipynb
-   python Roboflow_using_Yolo.ipynb
+   python SCB_Using_Yolo.py
+   python Roboflow_Using_Yolo.py
    ```
 
 4. **Train the Vision Transformer model.**
 
    ```bash
-   python scb_using_VisionTransformers.ipynb
-   python Roboflow_using_ViT.ipynb
+   python SCB_Using_ViT.py
+   python Roboflow_Using_ViT.py
    ```
 
 5. **Hybrid Inference.**
