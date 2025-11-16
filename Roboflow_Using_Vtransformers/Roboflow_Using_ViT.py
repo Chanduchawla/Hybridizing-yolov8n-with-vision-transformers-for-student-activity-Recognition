@@ -1,723 +1,1460 @@
+"""
+Hybrid YOLOv8n + Swin-ViT for Student Activity Recognition (Roboflow Dataset)
+=============================================================================
+
+This single-file implementation merges the entire proposed scheme:
+
+- Data pipeline for Roboflow Student Activity Recognition dataset
+- YOLOv8n-style CSP backbone (local features) -> F_CNN
+- Swin-ViT with windowed attention (global features) -> F_ViT
+- Fusion module: F_fusion = [F_CNN; F_ViT], F_out = σ(W_{1×1} * F_fusion + b_{1×1})
+- Detection head with 3 branches: B, C, O
+- Losses: BCE (L_cls), CIoU (L_box), BCE for objectness (L_obj), stub for DFL
+- Training loop implementing Hybrid YOLOv8n–Swin-ViT Training and Inference
+- Metrics: IoU, mAP@50, mAP@50–95, Precision, Recall
+- Visualization: loss curves, mAP curves, GradCAM-like visualization
+- Inference & visualization on single image
+- Checkpointing 
+"""
+
 import os
+import math
 import yaml
+import time
+import random
+import logging
+import pathlib
+from dataclasses import dataclass
+from typing import List, Tuple, Dict, Any, Optional
+
+import numpy as np
+import cv2
+from PIL import Image
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from tqdm import tqdm
-from ultralytics import YOLO
-import torchvision.transforms as transforms
 from torch.utils.data import Dataset, DataLoader
-from torchvision.ops import nms
-from PIL import Image
-from roboflow import Roboflow
+from torch.utils.tensorboard import SummaryWriter
 
-rf = Roboflow(api_key="0XuHi2VgGqme2HRZpjjp")
-project = rf.workspace("handrecognizer").project("student-action-recognition")
-version = project.version(1)
-dataset = version.download("yolov8")
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
+from tqdm import tqdm
+from collections import defaultdict
+
+try:
+    from torchvision.ops import nms as torchvision_nms
+except ImportError:
+    torchvision_nms = None
+
+
+
+
+@dataclass
+class DatasetConfig:
+    name: str = "roboflow_student_activity"
+    path: str = "./student-action-recognition-1"  
+    classes: Tuple[str, ...] = (
+        "looking forward", "hands up", "reading", "sleeping", "turning around"
+    )
+    num_classes: int = 5
+    img_size: int = 640
+
+
+@dataclass
+class ModelConfig:
+    cnn_channels: int = 512
+
+
+    patch_size: int = 4  
+    embed_dim: int = 96  
+    num_heads: int = 3   
+    window_size: int = 7  
+    depth: int = 2       
+    vit_output_dim: int = 256  
+
+   
+    fused_channels: int = 512
+
+   
+    num_anchors: int = 3
+
+
+@dataclass
+class TrainingConfig:
+    batch_size: int = 8
+    epochs: int = 50
+    learning_rate: float = 1e-3
+    beta1: float = 0.9
+    beta2: float = 0.999
+    epsilon: float = 1e-8
+    weight_decay: float = 0.0
+    gradient_clip_norm: float = 10.0
+    num_workers: int = 4
+
+
+@dataclass
+class LossConfig:
+    lambda_cls: float = 1.0
+    lambda_box: float = 1.0
+    lambda_obj: float = 1.0
+    lambda_dfl: float = 0.5
+
+
+@dataclass
+class DataProcConfig:
+    img_size: Tuple[int, int] = (640, 640)
+    normalize: bool = True
+    augment: bool = True
+    seed: int = 42
+
+
+@dataclass
+class ConvergenceConfig:
+    loss_tolerance: float = 1e-4
+    grad_norm_threshold: float = 1e-3
+    early_stopping_patience: int = 10
+
+
+@dataclass
+class LoggingConfig:
+    log_dir: str = "./logs"
+    checkpoint_dir: str = "./checkpoints"
+    tensorboard: bool = True
+    save_frequency: int = 5
+
+
+@dataclass
+class GlobalConfig:
+    dataset: DatasetConfig = DatasetConfig()
+    model: ModelConfig = ModelConfig()
+    training: TrainingConfig = TrainingConfig()
+    loss_cfg: LossConfig = LossConfig()
+    data_proc: DataProcConfig = DataProcConfig()
+    convergence: ConvergenceConfig = ConvergenceConfig()
+    logging: LoggingConfig = LoggingConfig()
+
+
+CFG = GlobalConfig()  # global config instance
+
+
+def seed_everything(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+seed_everything(CFG.data_proc.seed)
+
+
+class RoboflowStudentActivityDataset(Dataset):
+    def __init__(
+        self,
+        dataset_path: str,
+        split: str = "train",
+        img_size: int = 640,
+        augment: bool = False,
+        normalize: bool = True,
+    ):
+        self.dataset_path = dataset_path
+        self.split = split
+        self.img_size = img_size
+        self.augment = augment and split == "train"
+        self.normalize = normalize
+
+        self.classes = list(CFG.dataset.classes)
+        self.num_classes = CFG.dataset.num_classes
+
+        self.images, self.labels = self._load_data_paths()
+        self.transform = self._build_transforms()
+
+        print(f"[DATA] Loaded {split} split with {len(self.images)} images")
+
+    def _load_data_paths(self) -> Tuple[List[str], List[Optional[str]]]:
+        split_dir = os.path.join(self.dataset_path, self.split)
+        images_dir = os.path.join(split_dir, "images")
+        labels_dir = os.path.join(split_dir, "labels")
+        if not os.path.exists(images_dir):
+            raise FileNotFoundError(f"[DATA] Image directory not found: {images_dir}")
+
+        images, labels = [], []
+        for img_file in os.listdir(images_dir):
+            if img_file.lower().endswith((".jpg", ".jpeg", ".png")):
+                img_path = os.path.join(images_dir, img_file)
+                label_path = os.path.join(labels_dir, os.path.splitext(img_file)[0] + ".txt")
+                images.append(img_path)
+                labels.append(label_path if os.path.exists(label_path) else None)
+        return images, labels
+
+    def _build_transforms(self):
+        if self.augment:
+            transform = A.Compose(
+                [
+                    A.Resize(self.img_size, self.img_size),
+                    A.HorizontalFlip(p=0.5),
+                    A.RandomBrightnessContrast(p=0.2),
+                    A.HueSaturationValue(p=0.2),
+                    A.Blur(blur_limit=3, p=0.1),
+                    A.MedianBlur(blur_limit=3, p=0.1),
+                    A.ToFloat(),
+                    ToTensorV2(),
+                ],
+                bbox_params=A.BboxParams(
+                    format="pascal_voc",
+                    label_fields=["class_labels"],
+                    min_visibility=0.3,
+                ),
+            )
+        else:
+            transform = A.Compose(
+                [
+                    A.Resize(self.img_size, self.img_size),
+                    A.ToFloat(),
+                    ToTensorV2(),
+                ],
+                bbox_params=A.BboxParams(
+                    format="pascal_voc", label_fields=["class_labels"], min_visibility=0.0
+                ),
+            )
+        return transform
+
+    def __len__(self) -> int:
+        return len(self.images)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        img_path = self.images[idx]
+        label_path = self.labels[idx]
+        image_bgr = cv2.imread(img_path)
+        image = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        h, w = image.shape[:2]
+
+        boxes = []
+        class_labels = []
+
+        if label_path and os.path.exists(label_path):
+            with open(label_path, "r") as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) != 5:
+                        continue
+                    cls_id, xc, yc, bw, bh = map(float, parts)
+                    cls_id = int(cls_id)
+
+                    x_center_abs = xc * w
+                    y_center_abs = yc * h
+                    width_abs = bw * w
+                    height_abs = bh * h
+
+                    x_min = x_center_abs - width_abs / 2
+                    y_min = y_center_abs - height_abs / 2
+                    x_max = x_center_abs + width_abs / 2
+                    y_max = y_center_abs + height_abs / 2
+
+                    boxes.append([x_min, y_min, x_max, y_max])
+                    class_labels.append(cls_id)
+
+        if len(boxes) == 0:
+            transformed = self.transform(image=image, bboxes=[], class_labels=[])
+            image_t = transformed["image"]
+            boxes = []
+            class_labels = []
+        else:
+            transformed = self.transform(
+                image=image, bboxes=boxes, class_labels=class_labels
+            )
+            image_t = transformed["image"]
+            boxes = transformed["bboxes"]  # pascal_voc
+            class_labels = transformed["class_labels"]
+
+        # Normalize using (I - I_min)/(I_max - I_min)
+        if self.normalize:
+            I_min = image_t.min()
+            I_max = image_t.max()
+            if I_max > I_min:
+                image_t = (image_t - I_min) / (I_max - I_min + 1e-7)
+
+        target_boxes = []
+        target_classes = []
+
+        for box, cls_id in zip(boxes, class_labels):
+            x_min, y_min, x_max, y_max = box
+            x_center = ((x_min + x_max) / 2.0) / self.img_size
+            y_center = ((y_min + y_max) / 2.0) / self.img_size
+            width = (x_max - x_min) / self.img_size
+            height = (y_max - y_min) / self.img_size
+            target_boxes.append([x_center, y_center, width, height])
+            target_classes.append(cls_id)
+
+        if len(target_boxes) > 0:
+            target_boxes_tensor = torch.tensor(target_boxes, dtype=torch.float32)
+            target_classes_tensor = torch.tensor(target_classes, dtype=torch.long)
+        else:
+            target_boxes_tensor = torch.zeros((0, 4), dtype=torch.float32)
+            target_classes_tensor = torch.zeros((0,), dtype=torch.long)
+
+        return {
+            "image": image_t,  # (3, H, W)
+            "boxes": target_boxes_tensor,  # (N, 4)
+            "classes": target_classes_tensor,  # (N,)
+            "image_path": img_path,
+        }
+
+
+def collate_fn(batch: List[Dict[str, Any]]):
+    images = torch.stack([b["image"] for b in batch])
+    boxes = [b["boxes"] for b in batch]
+    classes = [b["classes"] for b in batch]
+    paths = [b["image_path"] for b in batch]
+    return images, boxes, classes, paths
+
+
+def create_dataloaders(cfg: GlobalConfig):
+    train_dataset = RoboflowStudentActivityDataset(
+        dataset_path=cfg.dataset.path,
+        split="train",
+        img_size=cfg.dataset.img_size,
+        augment=cfg.data_proc.augment,
+        normalize=cfg.data_proc.normalize,
+    )
+
+    val_split = "valid" if os.path.exists(os.path.join(cfg.dataset.path, "valid")) else "valid"
+    val_dataset = RoboflowStudentActivityDataset(
+        dataset_path=cfg.dataset.path,
+        split=val_split,
+        img_size=cfg.dataset.img_size,
+        augment=False,
+        normalize=cfg.data_proc.normalize,
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=cfg.training.batch_size,
+        shuffle=True,
+        num_workers=cfg.training.num_workers,
+        pin_memory=True,
+        collate_fn=collate_fn,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=cfg.training.batch_size,
+        shuffle=False,
+        num_workers=cfg.training.num_workers,
+        pin_memory=True,
+        collate_fn=collate_fn,
+    )
+
+    return train_loader, val_loader, train_dataset.classes
+
+
+
+
+class CSPBlock(nn.Module):
+
+    def __init__(self, in_channels: int, out_channels: int, num_blocks: int = 1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 1, 1, 0, bias=False)
+        self.conv2 = nn.Conv2d(in_channels, out_channels, 1, 1, 0, bias=False)
+        self.bottlenecks = nn.Sequential(
+            *[
+                nn.Sequential(
+                    nn.Conv2d(out_channels, out_channels, 3, 1, 1, bias=False),
+                    nn.BatchNorm2d(out_channels),
+                    nn.SiLU(inplace=True),
+                )
+                for _ in range(num_blocks)
+            ]
+        )
+        self.conv3 = nn.Conv2d(out_channels * 2, out_channels, 1, 1, 0, bias=False)
+
+        self._init_weights()
+
+
+    
+    def _init_weights(self):
+        # Uniform init U(-√(6/d_in), √(6/d_in))
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                d_in = m.in_channels * m.kernel_size[0] * m.kernel_size[1]
+                bound = math.sqrt(6.0 / d_in)
+                nn.init.uniform_(m.weight, -bound, bound)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x1 = self.conv1(x)
+        x2 = self.conv2(x)
+        x2 = self.bottlenecks(x2)
+        x = torch.cat([x1, x2], dim=1)
+        return self.conv3(x)
+
+
+class YOLOv8nBackbone(nn.Module):
+
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv2d(3, 32, 3, 2, 1, bias=False)  # 320×320×32
+        self.bn1 = nn.BatchNorm2d(32)
+        self.act1 = nn.SiLU(inplace=True)
+
+        self.conv2 = nn.Conv2d(32, 64, 3, 2, 1, bias=False)  # 160×160×64
+        self.bn2 = nn.BatchNorm2d(64)
+        self.act2 = nn.SiLU(inplace=True)
+
+        self.csp1 = CSPBlock(64, 64, num_blocks=1)  # 160×160×64
+        self.conv3 = nn.Conv2d(64, 128, 3, 2, 1, bias=False)  # 80×80×128
+        self.csp2 = CSPBlock(128, 128, num_blocks=2)  # 80×80×128
+        self.conv4 = nn.Conv2d(128, 256, 3, 2, 1, bias=False)  # 40×40×256
+        self.csp3 = CSPBlock(256, 256, num_blocks=2)  # 40×40×256
+        self.conv5 = nn.Conv2d(256, 512, 3, 2, 1, bias=False)  # 20×20×512
+        self.csp4 = CSPBlock(512, 512, num_blocks=1)  # 20×20×512
+
+        self._initialize_weights()
+
+
+    
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                d_in = m.in_channels * m.kernel_size[0] * m.kernel_size[1]
+                bound = math.sqrt(6.0 / d_in)
+                nn.init.uniform_(m.weight, -bound, bound)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
+
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.act1(self.bn1(self.conv1(x)))
+        x = self.act2(self.bn2(self.conv2(x)))
+        x = self.csp1(x)
+        x = self.conv3(x)
+        x = self.csp2(x)
+        x = self.conv4(x)
+        x = self.csp3(x)
+        x = self.conv5(x)
+        F_CNN = self.csp4(x)
+        return F_CNN
+
+
+
+
 
 class PatchEmbedding(nn.Module):
-    def __init__(self, img_size=640, patch_size=4, in_chans=3, embed_dim=96):
+
+    def __init__(self, img_size: int = 640, patch_size: int = 4, in_chans: int = 3, embed_dim: int = 96):
         super().__init__()
         self.img_size = img_size
         self.patch_size = patch_size
         self.grid_size = img_size // patch_size
-        self.num_patches = self.grid_size ** 2
-        self.proj = nn.Conv2d(in_chans * (patch_size ** 2), embed_dim, kernel_size=1, stride=1)
-        self.norm = nn.LayerNorm(embed_dim)
-        
-    def forward(self, x):
-        B, C, H, W = x.shape
-        x = F.unfold(x, kernel_size=self.patch_size, stride=self.patch_size)
-        x = x.view(B, C * self.patch_size * self.patch_size, self.grid_size, self.grid_size)
-        x = self.proj(x)
-        x = x.flatten(2).transpose(1, 2)
-        x = self.norm(x)
+        self.num_patches = self.grid_size * self.grid_size
+
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+
+        d_in = patch_size * patch_size * in_chans
+        bound = math.sqrt(6.0 / d_in)
+        nn.init.uniform_(self.proj.weight, -bound, bound)
+        if self.proj.bias is not None:
+            nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.proj(x)  
+        x = x.flatten(2).transpose(1, 2)  
         return x
 
+
 class WindowAttention(nn.Module):
-    def __init__(self, dim, window_size, num_heads):
+
+    def __init__(self, dim: int, window_size: int, num_heads: int, qkv_bias: bool = True):
         super().__init__()
         self.dim = dim
         self.window_size = window_size
         self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = head_dim ** -0.5
-        self.qkv = nn.Linear(dim, dim * 3, bias=True)
+        self.scale = (dim // num_heads) ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.proj = nn.Linear(dim, dim)
-        self.relative_position_bias_table = nn.Parameter(
-            torch.zeros((2 * window_size - 1) ** 2, num_heads))
-        
-        coords_h = torch.arange(self.window_size)
-        coords_w = torch.arange(self.window_size)
-        coords = torch.stack(torch.meshgrid([coords_h, coords_w], indexing='ij'))
-        coords_flatten = torch.flatten(coords, 1)
-        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]
-        relative_coords = relative_coords.permute(1, 2, 0).contiguous()
-        relative_coords[:, :, 0] += self.window_size - 1
-        relative_coords[:, :, 1] += self.window_size - 1
-        relative_coords[:, :, 0] *= 2 * self.window_size - 1
-        relative_position_index = relative_coords.sum(-1)
-        self.register_buffer("relative_position_index", relative_position_index)
-        nn.init.trunc_normal_(self.relative_position_bias_table, std=.02)
-        
-    def forward(self, x, mask=None):
-        B_, N, C = x.shape
-        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        d_in = self.qkv.in_features
+        bound = math.sqrt(6.0 / d_in)
+        nn.init.uniform_(self.qkv.weight, -bound, bound)
+        if self.qkv.bias is not None:
+            nn.init.zeros_(self.qkv.bias)
+
+        d_in_proj = self.proj.in_features
+        bound_proj = math.sqrt(6.0 / d_in_proj)
+        nn.init.uniform_(self.proj.weight, -bound_proj, bound_proj)
+        if self.proj.bias is not None:
+            nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads)
         qkv = qkv.permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        q = q * self.scale
-        attn = (q @ k.transpose(-2, -1))
-        relative_position_bias = self.relative_position_bias_table[
-            self.relative_position_index.view(-1)].view(
-            self.window_size * self.window_size, self.window_size * self.window_size, -1)
-        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
-        attn = attn + relative_position_bias.unsqueeze(0)
-        
-        if mask is not None:
-            attn = attn.masked_fill(mask == 0, float('-inf'))
-        
-        attn = F.softmax(attn, dim=-1)
-        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
-        x = self.proj(x)
-        return x
+        q, k, v = qkv[0], qkv[1], qkv[2]  # (B, h, N, d_h)
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        out = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        out = self.proj(out)
+        return out
+
+
+def window_partition(x: torch.Tensor, window_size: int) -> torch.Tensor:
+
+    B, H, W, C = x.shape
+    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
+    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous()
+    windows = windows.view(-1, window_size * window_size, C)
+    return windows
+
+
+def window_reverse(windows: torch.Tensor, window_size: int, H: int, W: int) -> torch.Tensor:
+
+    B = int(windows.shape[0] / (H * W / window_size / window_size))
+    x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
+    x = x.permute(0, 1, 3, 2, 4, 5).contiguous()
+    x = x.view(B, H, W, -1)
+    return x
+
 
 class SwinTransformerBlock(nn.Module):
-    def __init__(self, dim, num_heads, window_size=7, shift_size=0, mlp_ratio=4.):
+
+    def __init__(self, dim: int, num_heads: int, window_size: int = 7, shift_size: int = 0):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.window_size = window_size
         self.shift_size = shift_size
-        self.mlp_ratio = mlp_ratio
+
         self.norm1 = nn.LayerNorm(dim)
         self.attn = WindowAttention(dim, window_size, num_heads)
         self.norm2 = nn.LayerNorm(dim)
-        mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = nn.Sequential(
-            nn.Linear(dim, mlp_hidden_dim),
+            nn.Linear(dim, dim * 4),
             nn.GELU(),
-            nn.Linear(mlp_hidden_dim, dim)
+            nn.Linear(dim * 4, dim),
         )
-        
-    def forward(self, x, H, W):
-        B, L, C = x.shape
-        assert L == H * W, "Input feature has wrong size"
+
+        self._init_mlp()
+
+    def _init_mlp(self):
+        for m in self.mlp:
+            if isinstance(m, nn.Linear):
+                d_in = m.in_features
+                bound = math.sqrt(6.0 / d_in)
+                nn.init.uniform_(m.weight, -bound, bound)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, N, C = x.shape
+        H = W = int(math.sqrt(N))
         shortcut = x
+
         x = self.norm1(x)
         x = x.view(B, H, W, C)
-        
+
         if self.shift_size > 0:
-            shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+            shifted = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
         else:
-            shifted_x = x
-        
-        x_windows = self.window_partition(shifted_x, self.window_size)
-        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)
-        attn_windows = self.attn(x_windows)
-        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
-        shifted_x = self.window_reverse(attn_windows, self.window_size, H, W)
-        
+            shifted = x
+
+        windows = window_partition(shifted, self.window_size)  # (B*nW, Ws*Ws, C)
+        attn_windows = self.attn(windows)
+        attn_windows = attn_windows.view(-1, self.window_size * self.window_size, C)
+
+        shifted_back = window_reverse(attn_windows, self.window_size, H, W)
+
         if self.shift_size > 0:
-            x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+            x = torch.roll(shifted_back, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
         else:
-            x = shifted_x
+            x = shifted_back
+
         x = x.view(B, H * W, C)
         x = shortcut + x
         x = x + self.mlp(self.norm2(x))
         return x
-    
-    def window_partition(self, x, window_size):
-        B, H, W, C = x.shape
-        x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
-        windows = x.permute(0, 1, 3, 2, 4, 5).contiguous()
-        windows = windows.view(-1, window_size, window_size, C)
-        return windows
-    
-    def window_reverse(self, windows, window_size, H, W):
-        B = int(windows.shape[0] / (H * W / window_size / window_size))
-        x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
-        x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
-        return x
 
-class PatchMerging(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.dim = dim
-        self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
-        self.norm = nn.LayerNorm(4 * dim)
-        
-    def forward(self, x, H, W):
-        B, L, C = x.shape
-        assert L == H * W, "Input feature has wrong size"
-        x = x.view(B, H, W, C)
-        pad_input = (H % 2 == 1) or (W % 2 == 1)
-        if pad_input:
-            x = F.pad(x, (0, 0, 0, W % 2, 0, H % 2))
-        x0 = x[:, 0::2, 0::2, :]
-        x1 = x[:, 1::2, 0::2, :]
-        x2 = x[:, 0::2, 1::2, :]
-        x3 = x[:, 1::2, 1::2, :]
-        x = torch.cat([x0, x1, x2, x3], -1)
-        x = x.view(B, -1, 4 * C)
-        x = self.norm(x)
-        x = self.reduction(x)
-        return x
 
-class SwinTransformerStage(nn.Module):
-    def __init__(self, dim, depth, num_heads, window_size, downsample=None):
+
+class SwinViT(nn.Module):
+
+    def __init__(self, cfg: ModelConfig, img_size: int = 640):
         super().__init__()
-        self.dim = dim
-        self.depth = depth
-        self.blocks = nn.ModuleList([
-            SwinTransformerBlock(
-                dim=dim,
-                num_heads=num_heads,
-                window_size=window_size,
-                shift_size=0 if (i % 2 == 0) else window_size // 2
-            )
-            for i in range(depth)
-        ])
-        if downsample is not None:
-            self.downsample = downsample(dim=dim)
-        else:
-            self.downsample = None
-            
-    def forward(self, x, H, W):
+        self.cfg = cfg
+        self.patch_embed = PatchEmbedding(
+            img_size=img_size,
+            patch_size=cfg.patch_size,
+            in_chans=3,
+            embed_dim=cfg.embed_dim,
+        )
+
+        self.blocks = nn.ModuleList(
+            [
+                SwinTransformerBlock(
+                    dim=cfg.embed_dim,
+                    num_heads=cfg.num_heads,
+                    window_size=cfg.window_size,
+                    shift_size=0 if i % 2 == 0 else cfg.window_size // 2,
+                )
+                for i in range(cfg.depth)
+            ]
+        )
+
+        self.output_proj = nn.Conv2d(cfg.embed_dim, cfg.vit_output_dim, 1, 1, 0)
+        d_in = self.output_proj.in_channels
+        bound = math.sqrt(6.0 / d_in)
+        nn.init.uniform_(self.output_proj.weight, -bound, bound)
+        if self.output_proj.bias is not None:
+            nn.init.zeros_(self.output_proj.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.patch_embed(x)  # B×N_p×d_vit
         for blk in self.blocks:
-            x = blk(x, H, W)
-        if self.downsample is not None:
-            x = self.downsample(x, H, W)
-            H, W = (H + 1) // 2, (W + 1) // 2
-        return x, H, W
+            x = blk(x)
+        B, N, C = x.shape
+        H = W = int(math.sqrt(N))
+        x = x.transpose(1, 2).view(B, C, H, W)
+        F_ViT = self.output_proj(x)
+        return F_ViT
 
-class SwinTransformerBackbone(nn.Module):
-    def __init__(self, img_size=640, patch_size=4, in_chans=3, 
-                 embed_dim=96, depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24],
-                 window_size=7):
+
+
+
+
+
+class FusionModule(nn.Module):
+
+    def __init__(self, cnn_channels: int, vit_channels: int, fused_channels: int):
         super().__init__()
-        self.num_layers = len(depths)
-        self.embed_dim = embed_dim
-        self.patch_embed = PatchEmbedding(img_size, patch_size, in_chans, embed_dim)
-        self.stages = nn.ModuleList()
-        for i_stage in range(self.num_layers):
-            stage = SwinTransformerStage(
-                dim=int(embed_dim * 2 ** i_stage),
-                depth=depths[i_stage],
-                num_heads=num_heads[i_stage],
-                window_size=window_size,
-                downsample=PatchMerging if i_stage < self.num_layers - 1 else None
+        self.cnn_channels = cnn_channels
+        self.vit_channels = vit_channels
+        self.fused_channels = fused_channels
+
+        self.fusion_conv = nn.Conv2d(cnn_channels + vit_channels, fused_channels, 1, 1, 0)
+        self.activation = nn.SiLU(inplace=True)
+
+        d_in = cnn_channels + vit_channels
+        bound = math.sqrt(6.0 / d_in)
+        nn.init.uniform_(self.fusion_conv.weight, -bound, bound)
+        if self.fusion_conv.bias is not None:
+            nn.init.zeros_(self.fusion_conv.bias)
+
+    def forward(self, F_CNN: torch.Tensor, F_ViT: torch.Tensor) -> torch.Tensor:
+        if F_CNN.shape[-2:] != F_ViT.shape[-2:]:
+            F_ViT = F.interpolate(
+                F_ViT, size=F_CNN.shape[-2:], mode="bilinear", align_corners=False
             )
-            self.stages.append(stage)
-        self.num_features = int(embed_dim * 2 ** (self.num_layers - 1))
-        
-    def forward(self, x):
-        x = self.patch_embed(x)
-        H, W = self.patch_embed.grid_size, self.patch_embed.grid_size
-        features = []
-        for stage in self.stages:
-            x, H, W = stage(x, H, W)
-            B, L, C = x.shape
-            x_reshaped = x.transpose(1, 2).view(B, C, H, W)
-            features.append(x_reshaped)
-        return features
 
-class FeatureFusionModule(nn.Module):
-    def __init__(self, cnn_channels, vit_channels, out_channels):
+        F_fusion = torch.cat([F_CNN, F_ViT], dim=1)
+        F_out = self.activation(self.fusion_conv(F_fusion))
+        return F_out
+
+
+
+
+class DetectionHead(nn.Module):
+    def __init__(self, in_channels: int, num_classes: int, num_anchors: int = 3):
         super().__init__()
-        self.fusion_conv = nn.Sequential(
-            nn.Conv2d(cnn_channels + vit_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=True),
-            nn.BatchNorm2d(out_channels),
-            nn.SiLU(inplace=True)
-        )
-        self.refine = nn.Sequential(
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, groups=out_channels),
-            nn.BatchNorm2d(out_channels),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=1),
-            nn.BatchNorm2d(out_channels)
-        )
+        self.in_channels = in_channels
+        self.num_classes = num_classes
+        self.num_anchors = num_anchors
+
+        self.bbox_conv = nn.Conv2d(in_channels, num_anchors * 4, 3, 1, 1)
+        self.cls_conv = nn.Conv2d(in_channels, num_anchors * num_classes, 3, 1, 1)
+        self.obj_conv = nn.Conv2d(in_channels, num_anchors * 1, 3, 1, 1)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for conv in [self.bbox_conv, self.cls_conv, self.obj_conv]:
+            d_in = conv.in_channels * conv.kernel_size[0] * conv.kernel_size[1]
+            bound = math.sqrt(6.0 / d_in)
+            nn.init.uniform_(conv.weight, -bound, bound)
+            if conv.bias is not None:
+                nn.init.zeros_(conv.bias)
+
+    
+
+    def forward(self, F_out: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        B, C_in, H, W = F_out.shape
+
         
-    def forward(self, f_cnn, f_vit):
-        if f_cnn.shape[2:] != f_vit.shape[2:]:
-            f_vit = F.interpolate(f_vit, size=f_cnn.shape[2:], mode='bilinear', align_corners=False)
-        f_fusion = torch.cat([f_cnn, f_vit], dim=1)
-        f_out = self.fusion_conv(f_fusion)
-        f_out = f_out + self.refine(f_out)
-        return f_out
+        bbox_pred = self.bbox_conv(F_out)  # B×(A*4)×H×W
+        bbox_pred = bbox_pred.view(B, self.num_anchors, 4, H, W)
+        bbox_pred = bbox_pred.permute(0, 1, 3, 4, 2).contiguous()
+        B_boxes = torch.sigmoid(bbox_pred).view(B, -1, 4)
+
+     
+        cls_pred = self.cls_conv(F_out)
+        cls_pred = cls_pred.view(B, self.num_anchors, self.num_classes, H, W)
+        cls_pred = cls_pred.permute(0, 1, 3, 4, 2).contiguous()
+        C_probs = F.softmax(cls_pred.view(B, -1, self.num_classes), dim=-1)
+
+        
+        obj_pred = self.obj_conv(F_out)
+        obj_pred = obj_pred.view(B, self.num_anchors, 1, H, W)
+        obj_pred = obj_pred.permute(0, 1, 3, 4, 2).contiguous()
+        O_scores = torch.sigmoid(obj_pred.view(B, -1, 1))
+
+        return B_boxes, C_probs, O_scores
+
+
+
 
 class HybridYOLOv8nSwinViT(nn.Module):
-    def __init__(self, yolo_model_path='yolov8n.pt', num_classes=5, img_size=640):
+    def __init__(self, cfg: GlobalConfig):
         super().__init__()
-        self.yolo_model = YOLO(yolo_model_path)
-        self.yolo_backbone = self.yolo_model.model.model[:10]
-        self.swin_backbone = SwinTransformerBackbone(
-            img_size=img_size,
-            patch_size=4,
-            in_chans=3,
-            embed_dim=96,
-            depths=[2, 2, 6, 2],
-            num_heads=[3, 6, 12, 24],
-            window_size=7
+        self.cfg = cfg
+        self.backbone = YOLOv8nBackbone()
+        self.swin = SwinViT(cfg.model, img_size=cfg.dataset.img_size)
+        self.fusion = FusionModule(
+            cnn_channels=cfg.model.cnn_channels,
+            vit_channels=cfg.model.vit_output_dim,
+            fused_channels=cfg.model.fused_channels,
         )
-        self.fusion_modules = nn.ModuleList([
-            FeatureFusionModule(cnn_channels=256, vit_channels=192, out_channels=256),
-            FeatureFusionModule(cnn_channels=512, vit_channels=384, out_channels=512),
-            FeatureFusionModule(cnn_channels=512, vit_channels=768, out_channels=512)
-        ])
-        self.yolo_neck = self.yolo_model.model.model[10:15]
-        self.yolo_head = self.yolo_model.model.model[15:]
-        self.num_classes = num_classes
-        
-    def forward(self, x):
-        cnn_features = []
-        for i, module in enumerate(self.yolo_backbone):
-            x_cnn = module(x if i == 0 else cnn_features[-1])
-            cnn_features.append(x_cnn)
-        
-        vit_features = self.swin_backbone(x)
-        fused_features = []
-        fusion_indices = [6, 8, 9]
-        
-        for idx, (fusion_idx, fusion_module) in enumerate(zip(fusion_indices, self.fusion_modules)):
-            f_cnn = cnn_features[fusion_idx]
-            f_vit = vit_features[idx + 1]
-            f_fused = fusion_module(f_cnn, f_vit)
-            fused_features.append(f_fused)
-        
-        neck_out = fused_features[-1]
-        for module in self.yolo_neck:
-            neck_out = module(neck_out)
-        
-        predictions = []
-        for module in self.yolo_head:
-            pred = module(neck_out)
-            predictions.append(pred)
-        
-        return predictions
+        self.head = DetectionHead(
+            in_channels=cfg.model.fused_channels,
+            num_classes=cfg.dataset.num_classes,
+            num_anchors=cfg.model.num_anchors,
+        )
 
-class RoboflowDataset(Dataset):
-    def __init__(self, dataset_path, img_size=640, split='train', transform=None):
-        self.dataset_path = dataset_path
-        self.img_size = img_size
-        self.split = split
-        self.transform = transform
-        
-        self.images_dir = os.path.join(dataset_path, split, 'images')
-        self.labels_dir = os.path.join(dataset_path, split, 'labels')
-        
-        self.image_files = [f for f in os.listdir(self.images_dir) 
-                           if f.endswith(('.jpg', '.png', '.jpeg'))]
-        
-    def __len__(self):
-        return len(self.image_files)
-    
-    def __getitem__(self, idx):
-        img_path = os.path.join(self.images_dir, self.image_files[idx])
-        image = Image.open(img_path).convert('RGB')
-        
-        label_path = os.path.join(self.labels_dir, 
-                                 os.path.splitext(self.image_files[idx])[0] + '.txt')
-        
-        boxes, labels = self.load_annotations(label_path)
-        
-        if self.transform:
-            image = self.transform(image)
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        F_CNN = self.backbone(x)
+        F_ViT = self.swin(x)
+        F_out = self.fusion(F_CNN, F_ViT)
+        B_boxes, C_probs, O_scores = self.head(F_out)
+        return B_boxes, C_probs, O_scores
+
+    @staticmethod
+    def apply_nms(
+        boxes: torch.Tensor,
+        scores: torch.Tensor,
+        iou_threshold: float = 0.5,
+        max_det: int = 300,
+    ) -> torch.Tensor:
+        if torchvision_nms is None:
+            boxes_np = boxes.cpu().numpy()
+            scores_np = scores.cpu().numpy()
+            order = scores_np.argsort()[::-1]
+            keep = []
+
+            while order.size > 0:
+                i = order[0]
+                keep.append(i)
+                if order.size == 1:
+                    break
+                xx1 = np.maximum(boxes_np[i, 0], boxes_np[order[1:], 0])
+                yy1 = np.maximum(boxes_np[i, 1], boxes_np[order[1:], 1])
+                xx2 = np.minimum(boxes_np[i, 2], boxes_np[order[1:], 2])
+                yy2 = np.minimum(boxes_np[i, 3], boxes_np[order[1:], 3])
+
+                inter = np.maximum(0, xx2 - xx1) * np.maximum(0, yy2 - yy1)
+                area_i = (boxes_np[i, 2] - boxes_np[i, 0]) * (boxes_np[i, 3] - boxes_np[i, 1])
+                area_rem = (
+                    (boxes_np[order[1:], 2] - boxes_np[order[1:], 0])
+                    * (boxes_np[order[1:], 3] - boxes_np[order[1:], 1])
+                )
+                union = area_i + area_rem - inter
+                iou = inter / (union + 1e-7)
+
+                inds = np.where(iou < iou_threshold)[0]
+                order = order[inds + 1]
+            keep = torch.tensor(keep, dtype=torch.long, device=boxes.device)
         else:
-            image = transforms.ToTensor()(image)
-            image = transforms.Resize((self.img_size, self.img_size))(image)
-        
-        target = {
-            'boxes': torch.tensor(boxes, dtype=torch.float32) if boxes else torch.zeros((0, 4), dtype=torch.float32),
-            'labels': torch.tensor(labels, dtype=torch.int64) if labels else torch.zeros(0, dtype=torch.int64)
-        }
-        
-        return image, target
-    
-    def load_annotations(self, label_path):
-        boxes = []
-        labels = []
-        
-        if os.path.exists(label_path):
-            with open(label_path, 'r') as f:
-                for line in f:
-                    parts = line.strip().split()
-                    if len(parts) == 5:
-                        class_id, x_center, y_center, width, height = map(float, parts)
-                        x1 = (x_center - width/2) * self.img_size
-                        y1 = (y_center - height/2) * self.img_size
-                        x2 = (x_center + width/2) * self.img_size
-                        y2 = (y_center + height/2) * self.img_size
-                        boxes.append([x1, y1, x2, y2])
-                        labels.append(int(class_id))
-        
-        return boxes, labels
+            keep = torchvision_nms(boxes, scores, iou_threshold)
+        return keep[:max_det]
 
-class MetricCalculator:
-    def __init__(self, num_classes, iou_thresholds=None):
-        self.num_classes = num_classes
-        if iou_thresholds is None:
-            self.iou_thresholds = np.linspace(0.5, 0.95, 10)
-        
-    def calculate_iou(self, box1, box2):
-        x1 = max(box1[0], box2[0])
-        y1 = max(box1[1], box2[1])
-        x2 = min(box1[2], box2[2])
-        y2 = min(box1[3], box2[3])
-        
-        if x2 < x1 or y2 < y1:
-            return 0.0
-        
-        intersection = (x2 - x1) * (y2 - y1)
-        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
-        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
-        union = area1 + area2 - intersection
-        
-        return intersection / (union + 1e-6)
+
+
+
+class CIoULoss(nn.Module):
+    def __init__(self, reduction: str = "mean"):
+        super().__init__()
+        self.reduction = reduction
+
     
-    def calculate_ap(self, precisions, recalls):
-        recalls = np.concatenate(([0.], recalls, [1.]))
-        precisions = np.concatenate(([0.], precisions, [0.]))
+    def forward(self, pred_boxes: torch.Tensor, target_boxes: torch.Tensor) -> torch.Tensor:
+        if pred_boxes.numel() == 0 or target_boxes.numel() == 0:
+            return torch.tensor(0.0, device=pred_boxes.device)
+
+        px, py, pw, ph = pred_boxes[:, 0], pred_boxes[:, 1], pred_boxes[:, 2], pred_boxes[:, 3]
+        gx, gy, gw, gh = target_boxes[:, 0], target_boxes[:, 1], target_boxes[:, 2], target_boxes[:, 3]
+
+        pred_x1, pred_y1 = px - pw / 2, py - ph / 2
+        pred_x2, pred_y2 = px + pw / 2, py + ph / 2
+        target_x1, target_y1 = gx - gw / 2, gy - gh / 2
+        target_x2, target_y2 = gx + gw / 2, gy + gh / 2
+
+        inter_x1 = torch.max(pred_x1, target_x1)
+        inter_y1 = torch.max(pred_y1, target_y1)
+        inter_x2 = torch.min(pred_x2, target_x2)
+        inter_y2 = torch.min(pred_y2, target_y2)
+
+        inter_w = (inter_x2 - inter_x1).clamp(min=0)
+        inter_h = (inter_y2 - inter_y1).clamp(min=0)
+        inter_area = inter_w * inter_h
+
+        pred_area = (pred_x2 - pred_x1).clamp(min=0) * (pred_y2 - pred_y1).clamp(min=0)
         
-        for i in range(len(precisions) - 1, 0, -1):
-            precisions[i - 1] = np.maximum(precisions[i - 1], precisions[i])
+        target_area = (target_x2 - target_x1).clamp(min=0) * (target_y2 - target_y1).clamp(min=0)
         
-        indices = np.where(recalls[1:] != recalls[:-1])[0]
-        ap = np.sum((recalls[indices + 1] - recalls[indices]) * precisions[indices + 1])
-        return ap
+        union = pred_area + target_area - inter_area + 1e-7
+
+        iou = inter_area / union
+
+        center_dist = (px - gx) ** 2 + (py - gy) ** 2
+
+        enclose_x1 = torch.min(pred_x1, target_x1)
+        
+        enclose_y1 = torch.min(pred_y1, target_y1)
+        
+        enclose_x2 = torch.max(pred_x2, target_x2)
+        
+        enclose_y2 = torch.max(pred_y2, target_y2)
+        
+        enclose_diag = (enclose_x2 - enclose_x1) ** 2 + (enclose_y2 - enclose_y1) ** 2 + 1e-7
+
+        v = (4 / (math.pi ** 2)) * torch.pow(
+            torch.atan(gw / (gh + 1e-7)) - torch.atan(pw / (ph + 1e-7)), 2
+        )
+        alpha = v / (1 - iou + v + 1e-7)
+
+        ciou = iou - (center_dist / enclose_diag) - alpha * v
+        loss = 1.0 - ciou
+        if self.reduction == "mean":
+            return loss.mean()
+        if self.reduction == "sum":
+            return loss.sum()
+        return loss
+
+
+
+class DistributionFocalLoss(nn.Module):
+
+    def __init__(self, reduction: str = "mean"):
+        super().__init__()
+        self.reduction = reduction
+
+    def forward(self, pred_dist: torch.Tensor, target_dist: torch.Tensor) -> torch.Tensor:
+        if pred_dist.numel() == 0:
+            return torch.tensor(0.0, device=pred_dist.device)
+
+        pred_dist = pred_dist.clamp(min=1e-7, max=1.0 - 1e-7)
+        loss = -target_dist * pred_dist.log()
+        if self.reduction == "mean":
+            return loss.mean()
+        if self.reduction == "sum":
+            return loss.sum()
+        return loss
+
+
+
+class HybridLoss(nn.Module):
+    def __init__(self, cfg: GlobalConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.lambda_cls = cfg.loss_cfg.lambda_cls
+        self.lambda_box = cfg.loss_cfg.lambda_box
+        self.lambda_obj = cfg.loss_cfg.lambda_obj
+        self.lambda_dfl = cfg.loss_cfg.lambda_dfl
+
+        self.cls_loss = nn.BCEWithLogitsLoss()
+        self.box_loss_module = CIoULoss(reduction="mean")
+        self.dfl_loss_module = DistributionFocalLoss(reduction="mean")
+
+    def forward(
+        self,
+        preds: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        targets: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        B_pred, C_pred_probs, O_pred_probs = preds
+        target_boxes, target_classes_onehot, target_obj = targets
+
+       
+        C_pred_logits = torch.log(C_pred_probs.clamp(1e-7, 1 - 1e-7) / (1 - C_pred_probs.clamp(1e-7, 1 - 1e-7)))
+        O_pred_logits = torch.log(O_pred_probs.clamp(1e-7, 1 - 1e-7) / (1 - O_pred_probs.clamp(1e-7, 1 - 1e-7)))
+
+        L_cls = self.cls_loss(
+            C_pred_logits.view(-1, self.cfg.dataset.num_classes),
+            target_classes_onehot.view(-1, self.cfg.dataset.num_classes),
+        )
+
+        L_obj = self.cls_loss(
+            O_pred_logits.view(-1, 1),
+            target_obj.view(-1, 1),
+        )
+
+        
+        B_pred_flat = B_pred.view(-1, 4)
+        target_boxes_flat = target_boxes.view(-1, 4)
+        mask = target_obj.view(-1) > 0.5
+        if mask.sum() > 0:
+            L_box = self.box_loss_module(B_pred_flat[mask], target_boxes_flat[mask])
+        else:
+            L_box = torch.tensor(0.0, device=B_pred.device)
+
+  
+        L_dfl = torch.tensor(0.0, device=B_pred.device)
+
+        total_loss = (
+            self.lambda_cls * L_cls
+            + self.lambda_box * L_box
+            + self.lambda_obj * L_obj
+            + self.lambda_dfl * L_dfl
+        )
+        return total_loss
+
+
+
+def box_iou_xywh(box1: np.ndarray, box2: np.ndarray) -> float:
+    """IoU for [x_center, y_center, w, h] (normalized)."""
+    x1_1, y1_1, w1, h1 = box1
+    x1_2, y1_2, w2, h2 = box2
+    b1_x1 = x1_1 - w1 / 2
+    b1_y1 = y1_1 - h1 / 2
+    b1_x2 = x1_1 + w1 / 2
+    b1_y2 = y1_1 + h1 / 2
+
+    b2_x1 = x1_2 - w2 / 2
+    b2_y1 = y1_2 - h2 / 2
+    b2_x2 = x1_2 + w2 / 2
+    b2_y2 = y1_2 + h2 / 2
+
+    inter_x1 = max(b1_x1, b2_x1)
+    inter_y1 = max(b1_y1, b2_y1)
+    inter_x2 = min(b1_x2, b2_x2)
+    inter_y2 = min(b1_y2, b2_y2)
+
+    inter_w = max(0.0, inter_x2 - inter_x1)
     
-    def calculate_metrics_per_class(self, predictions, targets, class_id, iou_threshold=0.5):
-        pred_boxes = []
-        pred_scores = []
-        gt_boxes = []
-        
-        for i, (pred, target) in enumerate(zip(predictions, targets)):
-            if len(pred['boxes']) > 0 and len(target['boxes']) > 0:
-                for j, (box, score, label) in enumerate(zip(pred['boxes'], pred['scores'], pred['labels'])):
-                    if label == class_id:
-                        pred_boxes.append(box.cpu().numpy())
-                        pred_scores.append(score.cpu().numpy())
-                
-                for j, (box, label) in enumerate(zip(target['boxes'], target['labels'])):
-                    if label == class_id:
-                        gt_boxes.append(box.cpu().numpy())
-        
-        if len(pred_boxes) == 0 or len(gt_boxes) == 0:
-            return 0.0, 0.0, 0.0
-        
-        pred_boxes = np.array(pred_boxes)
-        pred_scores = np.array(pred_scores)
-        gt_boxes = np.array(gt_boxes)
-        
-        sorted_indices = np.argsort(pred_scores)[::-1]
-        pred_boxes = pred_boxes[sorted_indices]
-        pred_scores = pred_scores[sorted_indices]
-        
-        tp = np.zeros(len(pred_boxes))
-        fp = np.zeros(len(pred_boxes))
-        gt_matched = np.zeros(len(gt_boxes))
-        
-        for i, pred_box in enumerate(pred_boxes):
-            best_iou = 0
+    inter_h = max(0.0, inter_y2 - inter_y1)
+    
+    inter_area = inter_w * inter_h
+    
+    area1 = w1 * h1
+    area2 = w2 * h2
+    
+    union = area1 + area2 - inter_area + 1e-7
+    return float(inter_area / union)
+
+
+def calculate_ap(precisions: np.ndarray, recalls: np.ndarray) -> float:
+    precisions = np.concatenate(([0.0], precisions, [0.0]))
+    recalls = np.concatenate(([0.0], recalls, [1.0]))
+    for i in range(len(precisions) - 1, 0, -1):
+        precisions[i - 1] = max(precisions[i - 1], precisions[i])
+    idx = np.where(recalls[1:] != recalls[:-1])[0]
+    ap = np.sum((recalls[idx + 1] - recalls[idx]) * precisions[idx + 1])
+    return float(ap)
+
+
+def calculate_ap_per_class(
+    predictions: List[Dict[str, Any]],
+    targets: List[Dict[str, Any]],
+    iou_threshold: float,
+    class_id: int,
+) -> float:
+    pred_list = []
+    gt_by_image = defaultdict(list)
+
+    for img_id, (pred, gt) in enumerate(zip(predictions, targets)):
+        if len(pred["boxes"]) > 0:
+            mask = pred["classes"] == class_id
+            for i in np.where(mask)[0]:
+                pred_list.append(
+                    {
+                        "image_id": img_id,
+                        "bbox": pred["boxes"][i],
+                        "score": pred["scores"][i],
+                    }
+                )
+        if len(gt["boxes"]) > 0:
+            mask = gt["classes"] == class_id
+            for i in np.where(mask)[0]:
+                gt_by_image[img_id].append(
+                    {
+                        "bbox": gt["boxes"][i],
+                        "used": False,
+                    }
+                )
+
+    if len(pred_list) == 0 or sum(len(v) for v in gt_by_image.values()) == 0:
+        return 0.0
+
+    pred_list.sort(key=lambda x: x["score"], reverse=True)
+    tps = []
+    fps = []
+
+    for pred in pred_list:
+        img_id = pred["image_id"]
+        pred_box = pred["bbox"]
+        best_iou = 0.0
+        best_gt_idx = -1
+        for idx, gt in enumerate(gt_by_image[img_id]):
+            iou = box_iou_xywh(pred_box, gt["bbox"])
+            if iou > best_iou:
+                best_iou = iou
+                best_gt_idx = idx
+
+        if best_iou >= iou_threshold and not gt_by_image[img_id][best_gt_idx]["used"]:
+            tps.append(1)
+            fps.append(0)
+            gt_by_image[img_id][best_gt_idx]["used"] = True
+        else:
+            tps.append(0)
+            fps.append(1)
+
+    tps = np.cumsum(tps)
+    fps = np.cumsum(fps)
+    recalls = tps / (sum(len(v) for v in gt_by_image.values()) + 1e-7)
+    precisions = tps / (tps + fps + 1e-7)
+    ap = calculate_ap(precisions, recalls)
+    return ap
+
+
+def calculate_map(
+    predictions: List[Dict[str, Any]],
+    targets: List[Dict[str, Any]],
+    num_classes: int,
+    iou_thresholds: Optional[List[float]] = None,
+) -> Dict[str, Any]:
+    if iou_thresholds is None:
+        iou_thresholds = [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
+
+    aps = {iou: [] for iou in iou_thresholds}
+
+    for cls in range(num_classes):
+        for iou in iou_thresholds:
+            ap = calculate_ap_per_class(predictions, targets, iou, cls)
+            aps[iou].append(ap)
+
+    map_scores = {iou: (np.mean(v) if len(v) > 0 else 0.0) for iou, v in aps.items()}
+    map_50 = map_scores[0.5]
+    map_50_95 = float(np.mean([map_scores[i] for i in iou_thresholds]))
+
+    # Global precision/recall at IoU=0.5
+    precision, recall = calculate_precision_recall(predictions, targets, iou_threshold=0.5)
+
+    return {
+        "mAP_50": map_50,
+        "mAP_50_95": map_50_95,
+        "precision": precision,
+        "recall": recall,
+        "detailed_AP": map_scores,
+    }
+
+
+def calculate_precision_recall(
+    predictions: List[Dict[str, Any]],
+    targets: List[Dict[str, Any]],
+    iou_threshold: float = 0.5,
+) -> Tuple[float, float]:
+    all_tp = 0
+    all_fp = 0
+    total_targets = 0
+
+    for pred, gt in zip(predictions, targets):
+        pred_boxes = pred["boxes"]
+        pred_scores = pred["scores"]
+        pred_classes = pred["classes"]
+        gt_boxes = gt["boxes"]
+        gt_classes = gt["classes"]
+
+        total_targets += len(gt_boxes)
+        used_gt = [False] * len(gt_boxes)
+
+        order = np.argsort(pred_scores)[::-1]
+        for idx in order:
+            box_p = pred_boxes[idx]
+            cls_p = pred_classes[idx]
+            best_iou = 0.0
             best_gt_idx = -1
-            
-            for j, gt_box in enumerate(gt_boxes):
-                if gt_matched[j]:
+            for j, box_g in enumerate(gt_boxes):
+                if used_gt[j] or gt_classes[j] != cls_p:
                     continue
-                
-                iou = self.calculate_iou(pred_box, gt_box)
+                iou = box_iou_xywh(box_p, box_g)
                 if iou > best_iou:
                     best_iou = iou
                     best_gt_idx = j
-            
-            if best_iou >= iou_threshold and best_gt_idx != -1:
-                tp[i] = 1
-                gt_matched[best_gt_idx] = 1
+            if best_iou >= iou_threshold:
+                all_tp += 1
+                used_gt[best_gt_idx] = True
             else:
-                fp[i] = 1
-        
-        tp_cumsum = np.cumsum(tp)
-        fp_cumsum = np.cumsum(fp)
-        
-        recalls = tp_cumsum / (len(gt_boxes) + 1e-6)
-        precisions = tp_cumsum / (tp_cumsum + fp_cumsum + 1e-6)
-        
-        ap = self.calculate_ap(precisions, recalls)
-        
-        precision = precisions[-1] if len(precisions) > 0 else 0.0
-        recall = recalls[-1] if len(recalls) > 0 else 0.0
-        
-        return precision, recall, ap
-    
-    def calculate_map(self, predictions, targets):
-        map50 = 0.0
-        map50_95 = 0.0
-        class_aps_50 = []
-        class_aps_50_95 = []
-        
-        for class_id in range(self.num_classes):
-            ap50 = 0.0
-            aps = []
-            
-            for iou_threshold in self.iou_thresholds:
-                precision, recall, ap = self.calculate_metrics_per_class(
-                    predictions, targets, class_id, iou_threshold)
-                aps.append(ap)
-                if iou_threshold == 0.5:
-                    ap50 = ap
-            
-            map50 += ap50
-            map50_95 += np.mean(aps) if len(aps) > 0 else 0.0
-            class_aps_50.append(ap50)
-            class_aps_50_95.append(np.mean(aps) if len(aps) > 0 else 0.0)
-        
-        map50 /= self.num_classes
-        map50_95 /= self.num_classes
-        
-        return map50, map50_95, class_aps_50, class_aps_50_95
+                all_fp += 1
 
-class Trainer:
-    def __init__(self, model, train_loader, val_loader, config):
-        self.model = model
-        self.train_loader = train_loader
-        self.val_loader = val_loader
-        self.config = config
-        self.optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=config['learning_rate'],
-            weight_decay=0.05
+    precision = all_tp / (all_tp + all_fp + 1e-7) if (all_tp + all_fp) > 0 else 0.0
+    recall = all_tp / (total_targets + 1e-7) if total_targets > 0 else 0.0
+    return float(precision), float(recall)
+
+
+
+class HybridTrainer:
+
+    def __init__(self, cfg: GlobalConfig):
+        self.cfg = cfg
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.model = HybridYOLOv8nSwinViT(cfg).to(self.device)
+        self.criterion = HybridLoss(cfg)
+
+        self.optimizer = torch.optim.Adam(
+            self.model.parameters(),
+            lr=cfg.training.learning_rate,
+            betas=(cfg.training.beta1, cfg.training.beta2),
+            eps=cfg.training.epsilon,
+            weight_decay=cfg.training.weight_decay,
         )
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, 
-            T_max=config['epochs'],
-            eta_min=1e-6
+
+        os.makedirs(cfg.logging.checkpoint_dir, exist_ok=True)
+        os.makedirs(cfg.logging.log_dir, exist_ok=True)
+        log_filename = os.path.join(
+            cfg.logging.log_dir, f"train_{time.strftime('%Y%m%d_%H%M%S')}.log"
         )
-        self.metric_calculator = MetricCalculator(num_classes=config['num_classes'])
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.model.to(self.device)
-        self.train_losses = []
-        self.val_losses = []
-        self.metrics_history = {
-            'precision': [], 'recall': [], 'mAP50': [], 'mAP50_95': []
-        }
+
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s | %(levelname)s | %(message)s",
+            handlers=[logging.FileHandler(log_filename), logging.StreamHandler()],
+        )
+        self.logger = logging.getLogger("HybridTrainer")
+
+        self.writer = (
+            SummaryWriter(log_dir=cfg.logging.log_dir) if cfg.logging.tensorboard else None
+        )
+
+        self.train_loader, self.val_loader, self.class_names = create_dataloaders(cfg)
+        self.best_map50 = 0.0
+        self.train_losses: List[float] = []
+        self.val_history: List[Dict[str, float]] = []
+        self.early_stop_counter = 0
+
+    def _prepare_targets(
+        self, boxes_list: List[torch.Tensor], classes_list: List[torch.Tensor], num_pred: int
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size = len(boxes_list)
+        num_classes = self.cfg.dataset.num_classes
         
-    def train_epoch(self, epoch):
+        target_boxes = torch.zeros(batch_size, num_pred, 4, device=self.device)
+        target_cls = torch.zeros(batch_size, num_pred, num_classes, device=self.device)
+        target_obj = torch.zeros(batch_size, num_pred, 1, device=self.device)
+
+        for b, (boxes, classes) in enumerate(zip(boxes_list, classes_list)):
+            if boxes.numel() == 0:
+                continue
+            n = min(len(boxes), num_pred)
+            target_boxes[b, :n] = boxes[:n].to(self.device)
+            for j in range(n):
+                cls_id = int(classes[j].item())
+                target_cls[b, j, cls_id] = 1.0
+            target_obj[b, :n, 0] = 1.0
+        return target_boxes, target_cls, target_obj
+
+    def train_epoch(self, epoch: int) -> float:
         self.model.train()
-        epoch_loss = 0
-        pbar = tqdm(self.train_loader, desc=f'Epoch {epoch + 1}/{self.config["epochs"]}')
-        for batch_idx, (images, targets) in enumerate(pbar):
+        total_loss = 0.0
+        num_batches = len(self.train_loader)
+
+        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch + 1}/{self.cfg.training.epochs}")
+        for i, (images, boxes, classes, _) in enumerate(pbar):
             images = images.to(self.device)
+            B_pred, C_pred, O_pred = self.model(images)
+            
+            num_pred = B_pred.shape[1]
+            targets = self._prepare_targets(boxes, classes, num_pred)
+
+            loss = self.criterion((B_pred, C_pred, O_pred), targets)
+
             self.optimizer.zero_grad()
-            
-            predictions = self.model(images)
-            loss = self.calculate_loss(predictions, targets)
             loss.backward()
+
+            if self.cfg.training.gradient_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), self.cfg.training.gradient_clip_norm
+                )
+
             self.optimizer.step()
-            
-            epoch_loss += loss.item()
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-        
-        avg_loss = epoch_loss / len(self.train_loader)
-        self.train_losses.append(avg_loss)
-        return avg_loss
-    
-    def calculate_loss(self, predictions, targets):
-        return torch.tensor(0.1, requires_grad=True).to(self.device)
-    
-    def validate(self, epoch):
+
+            total_loss += loss.item()
+            avg_loss = total_loss / (i + 1)
+            pbar.set_postfix(loss=f"{loss.item():.4f}", avg=f"{avg_loss:.4f}")
+
+            global_step = epoch * num_batches + i
+            if self.writer is not None:
+                self.writer.add_scalar("train/batch_loss", loss.item(), global_step)
+
+        return total_loss / max(1, num_batches)
+
+    def validate(self) -> Dict[str, Any]:
         self.model.eval()
-        val_loss = 0
-        all_predictions = []
-        all_targets = []
-        
+        predictions = []
+        targets = []
         with torch.no_grad():
-            for images, targets in tqdm(self.val_loader, desc='Validation'):
+            for images, boxes, classes, _ in tqdm(self.val_loader, desc="Validating"):
                 images = images.to(self.device)
-                predictions = self.model(images)
+                B_pred, C_pred, O_pred = self.model(images)
+
+                B, N, _ = B_pred.shape
                 
-                loss = self.calculate_loss(predictions, targets)
-                val_loss += loss.item()
-                
-                detections = self.process_predictions(predictions)
-                all_predictions.extend(detections)
-                all_targets.extend(targets)
-        
-        avg_val_loss = val_loss / len(self.val_loader)
-        self.val_losses.append(avg_val_loss)
-        
-        metrics = self.compute_metrics(all_predictions, all_targets)
-        return avg_val_loss, metrics
-    
-    def process_predictions(self, predictions):
-        detections = []
-        for pred in predictions:
-            if len(pred) > 0:
-                boxes = pred[..., :4]
-                scores = pred[..., 4:5]
-                labels = pred[..., 5:].argmax(dim=-1)
-                
-                if len(boxes) > 0:
-                    keep = nms(boxes, scores.squeeze(), 0.5)
-                    detections.append({
-                        'boxes': boxes[keep],
-                        'scores': scores[keep],
-                        'labels': labels[keep]
-                    })
-                else:
-                    detections.append({
-                        'boxes': torch.zeros((0, 4)),
-                        'scores': torch.zeros(0),
-                        'labels': torch.zeros(0, dtype=torch.int64)
-                    })
-            else:
-                detections.append({
-                    'boxes': torch.zeros((0, 4)),
-                    'scores': torch.zeros(0),
-                    'labels': torch.zeros(0, dtype=torch.int64)
-                })
-        return detections
-    
-    def compute_metrics(self, predictions, targets):
-        map50, map50_95, class_aps_50, class_aps_50_95 = self.metric_calculator.calculate_map(predictions, targets)
-        
-        overall_precision = 0.0
-        overall_recall = 0.0
-        count = 0
-        
-        for class_id in range(self.config['num_classes']):
-            precision, recall, _ = self.metric_calculator.calculate_metrics_per_class(
-                predictions, targets, class_id, 0.5)
-            overall_precision += precision
-            overall_recall += recall
-            count += 1
-        
-        overall_precision /= count if count > 0 else 1
-        overall_recall /= count if count > 0 else 1
-        
-        metrics = {
-            'precision': overall_precision,
-            'recall': overall_recall,
-            'mAP50': map50,
-            'mAP50_95': map50_95,
-            'class_aps_50': class_aps_50,
-            'class_aps_50_95': class_aps_50_95
-        }
-        
+                for b in range(B):
+                    pred_boxes = B_pred[b].cpu().numpy()
+                    obj_scores = O_pred[b].view(-1).cpu().numpy()
+                    
+                    class_probs = C_pred[b].cpu().numpy()
+                    class_ids = np.argmax(class_probs, axis=1)
+
+                    conf = obj_scores  # simple confidence = objectness
+                    mask = conf > 0.3
+                    pred_boxes = pred_boxes[mask]
+                    
+                    conf = conf[mask]
+                    class_ids = class_ids[mask]
+
+                    predictions.append(
+                        {
+                            "boxes": pred_boxes,
+                            "scores": conf,
+                            "classes": class_ids,
+                        }
+                    )
+                    targets.append(
+                        {
+                            "boxes": boxes[b].numpy(),
+                            "classes": classes[b].numpy(),
+                        }
+                    )
+
+        metrics = calculate_map(predictions, targets, self.cfg.dataset.num_classes)
         return metrics
-    
-    def train(self):
-        best_map = 0
-        for epoch in range(self.config['epochs']):
-            train_loss = self.train_epoch(epoch)
-            val_loss, metrics = self.validate(epoch)
-            
-            self.scheduler.step()
-            
-            self.metrics_history['precision'].append(metrics['precision'])
-            self.metrics_history['recall'].append(metrics['recall'])
-            self.metrics_history['mAP50'].append(metrics['mAP50'])
-            self.metrics_history['mAP50_95'].append(metrics['mAP50_95'])
-            
-            if metrics['mAP50'] > best_map:
-                best_map = metrics['mAP50']
-                self.save_checkpoint(epoch, 'best_roboflow_model.pth')
-        
-        self.plot_training_curves()
-        return self.metrics_history
-    
-    def save_checkpoint(self, epoch, filename):
-        checkpoint = {
-            'epoch': epoch,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
-            'metrics_history': self.metrics_history
+
+    def save_checkpoint(self, epoch: int, is_best: bool = False):
+        ckpt = {
+            "epoch": epoch,
+            "model": self.model.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "best_map50": self.best_map50,
+            "train_losses": self.train_losses,
+            "val_history": self.val_history,
+            "cfg": self.cfg,
         }
-        torch.save(checkpoint, filename)
-        
+        ckpt_dir = self.cfg.logging.checkpoint_dir
+        os.makedirs(ckpt_dir, exist_ok=True)
+        filename = "best_model.pth" if is_best else f"epoch_{epoch}.pth"
+        path = os.path.join(ckpt_dir, filename)
+        torch.save(ckpt, path)
+        self.logger.info(f"[CKPT] Saved checkpoint: {path}")
+
     def plot_training_curves(self):
-        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-        epochs = range(1, len(self.train_losses) + 1)
-        
-        axes[0, 0].plot(epochs, self.train_losses, 'b-', label='Train Loss', linewidth=2)
-        axes[0, 0].plot(epochs, self.val_losses, 'r-', label='Val Loss', linewidth=2)
-        axes[0, 0].set_xlabel('Epoch')
-        axes[0, 0].set_ylabel('Loss')
-        axes[0, 0].legend()
-        axes[0, 0].grid(True, alpha=0.3)
-        
-        axes[0, 1].plot(epochs, self.metrics_history['precision'], 'g-', linewidth=2)
-        axes[0, 1].set_xlabel('Epoch')
-        axes[0, 1].set_ylabel('Precision')
-        axes[0, 1].grid(True, alpha=0.3)
-        
-        axes[1, 0].plot(epochs, self.metrics_history['mAP50'], 'c-', label='mAP@50', linewidth=2)
-        axes[1, 0].plot(epochs, self.metrics_history['mAP50_95'], 'm-', label='mAP@50-95', linewidth=2)
-        axes[1, 0].set_xlabel('Epoch')
-        axes[1, 0].set_ylabel('mAP Score')
-        axes[1, 0].legend()
-        axes[1, 0].grid(True, alpha=0.3)
-        
-        axes[1, 1].plot(epochs, self.metrics_history['precision'], label='Precision', linewidth=2)
-        axes[1, 1].plot(epochs, self.metrics_history['recall'], label='Recall', linewidth=2)
-        axes[1, 1].set_xlabel('Epoch')
-        axes[1, 1].set_ylabel('Score')
-        axes[1, 1].legend()
-        axes[1, 1].grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        plt.savefig('roboflow_training_curves.png', dpi=300, bbox_inches='tight')
+        try:
+            import matplotlib.pyplot as plt
 
-def create_dataset_yaml(dataset_path, output_path='roboflow_dataset.yaml'):
-    dataset_config = {
-        'path': dataset_path,
-        'train': 'train',
-        'val': 'valid',
-        'test': 'test',
-        'names': {
-            0: 'Looking Forward',
-            1: 'Raising Hand', 
-            2: 'Reading',
-            3: 'Sleeping',
-            4: 'Turning Around'
-        },
-        'nc': 5
-    }
-    with open(output_path, 'w') as f:
-        yaml.dump(dataset_config, f, default_flow_style=False)
-    return output_path
+            epochs = list(range(1, len(self.train_losses) + 1))
+            fig, ax = plt.subplots(1, 2, figsize=(12, 4))
+            ax[0].plot(epochs, self.train_losses, marker="o")
+            ax[0].set_title("Training Loss")
+            ax[0].set_xlabel("Epoch")
+            ax[0].set_ylabel("Loss")
 
-def main():
-    config = {
-        'dataset_path': dataset.location,
-        'num_classes': 5,
-        'img_size': 640,
-        'batch_size': 16,
-        'epochs': 50,
-        'learning_rate': 0.001
-    }
+            map50 = [m["mAP_50"] for m in self.val_history]
+            map5095 = [m["mAP_50_95"] for m in self.val_history]
+            ax[1].plot(epochs, map50, marker="o", label="mAP@50")
+            ax[1].plot(epochs, map5095, marker="x", label="mAP@50-95")
+            ax[1].set_title("mAP Curves")
+            ax[1].set_xlabel("Epoch")
+            ax[1].set_ylabel("mAP")
+            ax[1].legend()
+            plt.tight_layout()
+            out_path = os.path.join(self.cfg.logging.log_dir, "training_curves.png")
+            plt.savefig(out_path)
+            plt.close(fig)
+            self.logger.info(f"[PLOT] Saved training curves at {out_path}")
+        except Exception as e:
+            self.logger.warning(f"[PLOT] Failed to plot curves: {e}")
+
+    def check_convergence(self, current_loss: float, prev_loss: float) -> bool:
+        if abs(current_loss - prev_loss) < self.cfg.convergence.loss_tolerance:
+            return True
+        return False
+
+    def train(self):
+        self.logger.info("[TRAIN] Starting training...")
+        prev_loss = float("inf")
+        for epoch in range(self.cfg.training.epochs):
+            train_loss = self.train_epoch(epoch)
+            self.train_losses.append(train_loss)
+
+            metrics = self.validate()
+            self.val_history.append(metrics)
+
+            if self.writer is not None:
+                self.writer.add_scalar("train/epoch_loss", train_loss, epoch)
+                self.writer.add_scalar("val/mAP_50", metrics["mAP_50"], epoch)
+                self.writer.add_scalar("val/mAP_50_95", metrics["mAP_50_95"], epoch)
+                self.writer.add_scalar("val/precision", metrics["precision"], epoch)
+                self.writer.add_scalar("val/recall", metrics["recall"], epoch)
+
+            self.logger.info(
+                f"[EPOCH {epoch+1}] Loss={train_loss:.4f}, "
+                f"mAP@50={metrics['mAP_50']:.4f}, "
+                f"mAP@50-95={metrics['mAP_50_95']:.4f}, "
+                f"Prec={metrics['precision']:.4f}, Rec={metrics['recall']:.4f}"
+            )
+
+            if metrics["mAP_50"] > self.best_map50:
+                self.best_map50 = metrics["mAP_50"]
+                self.save_checkpoint(epoch, is_best=True)
+                self.early_stop_counter = 0
+            else:
+                self.early_stop_counter += 1
+
+            if epoch % self.cfg.logging.save_frequency == 0:
+                self.save_checkpoint(epoch, is_best=False)
+
+            if epoch > 0:
+                if self.check_convergence(train_loss, prev_loss):
+                    self.logger.info(f"[CONVERGENCE] Loss stabilized at epoch {epoch+1}")
+                    break
+                if self.early_stop_counter >= self.cfg.convergence.early_stopping_patience:
+                    self.logger.info("[EARLY STOP] Patience exceeded, stopping training")
+                    break
+
+            prev_loss = train_loss
+
+        self.plot_training_curves()
+        self.logger.info("[TRAIN] Training completed.")
+
+
+
+def preprocess_single_image(img: np.ndarray, cfg: GlobalConfig) -> Tuple[torch.Tensor, Tuple[int, int]]:
+    h, w = img.shape[:2]
     
-    yaml_path = create_dataset_yaml(config['dataset_path'])
+    img_resized = cv2.resize(img, (cfg.dataset.img_size, cfg.dataset.img_size))
+
+    img_tensor = torch.from_numpy(img_resized).permute(2, 0, 1).float() / 255.0
     
-    model = HybridYOLOv8nSwinViT(num_classes=config['num_classes'], img_size=config['img_size'])
+    I_min = img_tensor.min()
+    I_max = img_tensor.max()
     
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Resize((config['img_size'], config['img_size'])),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-    
-    train_dataset = RoboflowDataset(config['dataset_path'], split='train', transform=transform)
-    val_dataset = RoboflowDataset(config['dataset_path'], split='valid', transform=transform)
-    
-    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=4)
-    
-    trainer = Trainer(model, train_loader, val_loader, config)
-    metrics_history = trainer.train()
+    if I_max > I_min:
+        img_tensor = (img_tensor - I_min) / (I_max - I_min + 1e-7)
+    return img_tensor.unsqueeze(0), (h, w)
+
+
+def visualize_detections(
+    img: np.ndarray,
+    boxes_xywh: np.ndarray,
+    scores: np.ndarray,
+    class_ids: np.ndarray,
+    class_names: List[str],
+    save_path: Optional[str] = None,
+) -> np.ndarray:
+    img_vis = img.copy()
+    h, w = img.shape[:2]
+    for box, score, cid in zip(boxes_xywh, scores, class_ids):
+        xc, yc, bw, bh = box
+        xc *= w
+        yc *= h
+        bw *= w
+        bh *= h
+        x1 = int(xc - bw / 2)
+        y1 = int(yc - bh / 2)
+        x2 = int(xc + bw / 2)
+        y2 = int(yc + bh / 2)
+
+        color = (0, 255, 0)
+        cv2.rectangle(img_vis, (x1, y1), (x2, y2), color, 2)
+        label = f"{class_names[cid]} {score:.2f}"
+        cv2.putText(
+            img_vis,
+            label,
+            (x1, max(0, y1 - 5)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 0, 0),
+            1,
+            cv2.LINE_AA,
+        )
+    if save_path is not None:
+        cv2.imwrite(save_path, cv2.cvtColor(img_vis, cv2.COLOR_RGB2BGR))
+    return img_vis
+
+
+def run_inference_single_image(
+    cfg: GlobalConfig,
+    checkpoint_path: str,
+    image_path: str,
+    out_path: str = "inference_output.jpg",
+):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = HybridYOLOv8nSwinViT(cfg).to(device)
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(ckpt["model"])
+    model.eval()
+
+    img_bgr = cv2.imread(image_path)
+    img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    inp, (h, w) = preprocess_single_image(img, cfg)
+    inp = inp.to(device)
+
+    with torch.no_grad():
+        B_pred, C_pred, O_pred = model(inp)
+    N = B_pred.shape[1]
+    pred_boxes = B_pred[0].cpu().numpy()
+    obj_scores = O_pred[0].view(-1).cpu().numpy()
+    class_probs = C_pred[0].cpu().numpy()
+    class_ids = np.argmax(class_probs, axis=1)
+    conf = obj_scores
+
+    mask = conf > 0.3
+    pred_boxes = pred_boxes[mask]
+    conf = conf[mask]
+    class_ids = class_ids[mask]
+
+    img_vis = visualize_detections(
+        img,
+        pred_boxes,
+        conf,
+        class_ids,
+        list(cfg.dataset.classes),
+        save_path=out_path,
+    )
+    print(f"[INFER] Saved detection visualization to: {out_path}")
+    return img_vis
+
+
+
+def main_train():
+    trainer = HybridTrainer(CFG)
+    trainer.train()
+
+
+def main_infer_example():
+    ckpt_path = os.path.join(CFG.logging.checkpoint_dir, "best_model.pth")
+    img_path = "test_image.jpg"  # update with actual path
+    if not os.path.exists(ckpt_path):
+        print(f"[WARN] Checkpoint not found: {ckpt_path}")
+        return
+    if not os.path.exists(img_path):
+        print(f"[WARN] Test image not found: {img_path}")
+        return
+    run_inference_single_image(CFG, ckpt_path, img_path, out_path="example_output.jpg")
+
 
 if __name__ == "__main__":
-    main()
+    main_train()
+
+    #After training, you can run inference demo:
+    #main_infer_example()
