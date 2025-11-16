@@ -2,18 +2,24 @@
 Hybrid YOLOv8n + Swin-ViT for Student Activity Recognition (Roboflow Dataset)
 =============================================================================
 
-This single-file implementation merges the entire proposed scheme:
-
 - Data pipeline for Roboflow Student Activity Recognition dataset
+
 - YOLOv8n-style CSP backbone (local features) -> F_CNN
 - Swin-ViT with windowed attention (global features) -> F_ViT
+
 - Fusion module: F_fusion = [F_CNN; F_ViT], F_out = σ(W_{1×1} * F_fusion + b_{1×1})
+
 - Detection head with 3 branches: B, C, O
+
 - Losses: BCE (L_cls), CIoU (L_box), BCE for objectness (L_obj), stub for DFL
+
 - Training loop implementing Hybrid YOLOv8n–Swin-ViT Training and Inference
+
 - Metrics: IoU, mAP@50, mAP@50–95, Precision, Recall
+
 - Visualization: loss curves, mAP curves, GradCAM-like visualization
 - Inference & visualization on single image
+
 - Checkpointing 
 """
 
