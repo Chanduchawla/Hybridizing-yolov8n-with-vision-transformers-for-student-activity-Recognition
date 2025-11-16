@@ -1449,14 +1449,14 @@ def main_train():
 
 def main_infer_example():
     ckpt_path = os.path.join(CFG.logging.checkpoint_dir, "best_model.pth")
-    img_path = "test_image.jpg"  # update with actual path
+    img_path = "robo_tsimg.jpg" 
     if not os.path.exists(ckpt_path):
         print(f"[WARN] Checkpoint not found: {ckpt_path}")
         return
     if not os.path.exists(img_path):
         print(f"[WARN] Test image not found: {img_path}")
         return
-    run_inference_single_image(CFG, ckpt_path, img_path, out_path="example_output.jpg")
+    run_inference_single_image(CFG, ckpt_path, img_path, out_path="robo_exout.jpg")
 
 
 if __name__ == "__main__":
