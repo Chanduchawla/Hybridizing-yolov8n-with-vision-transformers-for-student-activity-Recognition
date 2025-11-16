@@ -1540,7 +1540,7 @@ def run_inference_single_image(
     cfg: GlobalConfig,
     checkpoint_path: str,
     image_path: str,
-    out_path: str = "example_output.jpg",
+    out_path: str = "robo_example_output.jpg",
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = HybridYOLOv8nSwinViT(cfg).to(device)
